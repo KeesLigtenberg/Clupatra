@@ -76,7 +76,7 @@ namespace clupatra_new{
 
   //-------------------------------------------------------------------------------
 
-  int addHitsAndFilterPixel( CluTrack* clu, HitListVector& hLV , double dChi2Max, double chi2Cut, unsigned maxStep, bool outwards,
+  int addHitsAndFilterPixel( CluTrack* clu, HitListVector& hLV , double dChi2Max, unsigned maxStep, bool outwards,
 			MarlinTrk::IMarlinTrkSystem* trkSys ) {
 
 	  	  int nHitsAdded = 0 ;
@@ -138,14 +138,14 @@ namespace clupatra_new{
 
 	      double maxDistanceToPreviousHit=100; //fixme: make parameter
 	      int LayersPerStep = 25; //fixme: make parameter
-	      unsigned maxStepsWithoutIntersection=2;
+//	      unsigned maxStepsWithoutIntersection=2;
 
-	      unsigned stepsWithoutHit = 0 , stepsSinceDirectionChange = 0, stepsWithoutIntersection = 0;
+	      unsigned stepsWithoutHit = 0 , stepsSinceDirectionChange = 0; // stepsWithoutIntersection = 0;
 	      int currentStepDirection = ( outwards ?  +1 : -1 );
 	      if(!outwards) layer-=LayersPerStep;
 
 	      ClupaHit* previousHit=startingHit;
-	      ClupaHit* firstHitAddedInRange=previousHit;
+//	      ClupaHit* firstHitAddedInRange=previousHit;
 	      bool atEndCap=false;
 
 	      while( stepsWithoutHit < maxStep and !atEndCap ) {
@@ -186,7 +186,7 @@ namespace clupatra_new{
 					  //try to reverse the step direction
 					  currentStepDirection*=-1;
 					  stepsSinceDirectionChange = 0;
-					  stepsWithoutIntersection=0;
+//					  stepsWithoutIntersection=0;
 //					  maxDistanceToPreviousHit=50;
 					  outerLayer=std::min(layer+4*LayersPerStep-1, maxTPCLayerID-1);
 					  streamlog_out(DEBUG8)<<"addHitsAndFilter(): reversing direction after current step"<<std::endl;
@@ -235,8 +235,8 @@ namespace clupatra_new{
 								<<   " chi2: " <<  0 //chiAtHit
 								<<   "  hit errors : { ";
 					  for(int i=0; i<6; i++) streamlog_out(DEBUG7) << sqrt( currentClustHit->first->lcioHit->getCovMatrix()[i] ) << (i==5 ? " }" : ", ");
-					  if(addHit!=IMarlinTrack::site_discarded ) streamlog_out( DEBUG7 ) <<   "----- deltaChi = " << deltaChi<< std::endl ;
-					  else streamlog_out(DEBUG7)<<std::endl;
+					  if(addHit!=IMarlinTrack::site_discarded ) { streamlog_out( DEBUG7 ) <<   "----- deltaChi = " << deltaChi<< std::endl ; }
+					  else { streamlog_out(DEBUG7)<<std::endl; }
 				  }
 
 				  if( addHit  == IMarlinTrack::success ) {
@@ -255,7 +255,7 @@ namespace clupatra_new{
 					  }
 
 					  previousHit=currentClustHit->first;
-					  if(!hitAdded) firstHitAddedInRange=currentClustHit->first;
+//					  if(!hitAdded) firstHitAddedInRange=currentClustHit->first;
 
 					  hitAdded = true ;
 					  ++nHitsAdded ;

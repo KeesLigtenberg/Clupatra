@@ -163,7 +163,7 @@ namespace clupatra_new{
 	 */
 	inline int getNumberOfHits(const HitListVector& hitsInLayer) {
 		int n=0;
-		for (int i=0; i<hitsInLayer.size(); i++) { n+=hitsInLayer[i].size(); }
+		for (unsigned i=0; i<hitsInLayer.size(); i++) { n+=hitsInLayer[i].size(); }
 		return n;
 	}
 
@@ -374,7 +374,7 @@ protected:
    *  successfully merging a hit.
    */
   int addHitsAndFilter( CluTrack* clu, HitListVector& hLV , double dChiMax, double chi2Cut, unsigned maxStep, ZIndex& zIndex,  bool backward=false,	MarlinTrk::IMarlinTrkSystem* trkSys=0) ;
-  int addHitsAndFilterPixel( CluTrack* clu, HitListVector& hLV , double dChi2Max, double chi2Cut, unsigned maxStep, bool backward=false, MarlinTrk::IMarlinTrkSystem* trkSys=nullptr );
+  int addHitsAndFilterPixel( CluTrack* clu, HitListVector& hLV , double dChi2Max, unsigned maxStep, bool backward=false, MarlinTrk::IMarlinTrkSystem* trkSys=nullptr );
 //------------------------------------------------------------------------------------------
   
   /** Try to add a hit from the given HitList in layer of subdetector to the track.

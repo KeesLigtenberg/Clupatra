@@ -685,8 +685,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 
   Clusterer nncl ;
   
-  int outerRow = 0 ;
-  
+
   nnclu::PtrVector<MarlinTrk::IMarlinTrack> seedTrks ;
   seedTrks.setOwner() ; // memory mgmt - will delete MarlinTrks at the end
   IMarlinTrkFitter fitter( _trksystem, pixelTPC ? _chi2Cut : DBL_MAX ) ;
@@ -707,7 +706,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 		  //while a maximum can be be found
 
 			  //if not enough hits
-			  if(hitsInRowRange.size() < _minCluSize ) { streamlog_out( DEBUG8 ) << "continue because not enough hits in row range"<<std::endl; continue;}
+			  if(hitsInRowRange.size() < unsigned( _minCluSize ) ) { streamlog_out( DEBUG8 ) << "continue because not enough hits in row range"<<std::endl; continue;}
 
 			  //make histogram
 			  PhiHistogram phiTrackFinder(600); //fixme: make number of bins parameter
@@ -728,10 +727,10 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 				  //get one maximum
 				  Clusterer::cluster_type cluster=phiTrackFinder.getMaximimumCluster(2); //ascending
 				  streamlog_out(DEBUG8)<<"found cluster of size "<<cluster.size()<<std::endl;
-				  if(cluster.size()<_minCluSize) continue; //fixme: make parameter
+				  if(cluster.size()<unsigned(_minCluSize)) continue; //fixme: make parameter
 
 				  cluster=clupatra_new::cutHitsFromCluster(cluster, maxPhi, 10, 3);//fixme: make parameters
-				  if(cluster.size()<_minCluSize) continue; //fixme: make parameter
+				  if(cluster.size()<unsigned(_minCluSize)) continue; //fixme: make parameter
 
 				  //sort cluster (smallest layernumber first)
 				  cluster.sort( LayerSortOut() );
@@ -758,7 +757,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 
 				  int nHitsAdded = 0;
 				  //try to add more hits backwards and forward
-				  nHitsAdded += addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , false /*inwards*/) ;
+				  nHitsAdded += addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max , _maxStep , false /*inwards*/) ;
 				  streamlog_out(DEBUG8)<<"added "<<nHitsAdded<<" inwards to fit"<<std::endl;
 				  //repeat for backwards
 				  if(nHitsAdded > _minCluSize) {
@@ -774,7 +773,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 					  };
 
 
-					  nHitsAdded += addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , true /*outwards*/, _trksystem ) ;
+					  nHitsAdded += addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max , _maxStep , true /*outwards*/, _trksystem ) ;
 					  streamlog_out(DEBUG8)<<"added "<<nHitsAdded<<" in total to fit"<<std::endl;
 					  mTrk=cluster.ext<MarTrk>();//mTrk=current attached track
 				  }
@@ -816,11 +815,10 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 			  } //loop over clusters
 		  }//for side
 	  }//for outerRow
-	  breakAll :;
+//	  breakAll :;
   }//if phibinning transform
   else
   { //nnclustering
-
 	
 	  streamlog_out( DEBUG5 ) << "===============================================================================================\n"
 				  << "   first step of Clupatra algorithm: find seeds with NN-clustering  in " <<  _nLoop << " loops - max dist = " << _distCut <<" \n"
@@ -834,7 +832,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 
 		HitDistance dist( nloop * dcut , _cosAlphaCut ) ;
 
-		outerRow = maxTPCLayers - 1 ;
+		int outerRow = maxTPCLayers - 1 ;
 
 		while( outerRow >= _minCluSize ) { //_padRowRange * .5 ) {
 
@@ -874,7 +872,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 		Clusterer::cluster_list smallclu ;
 		smallclu.setOwner() ;
 		split_list( sclu, std::back_inserter(smallclu),  ClusterSize(  int( _padRowRange * _smallClusterPadRowFraction) ) ) ;
-		for( Clusterer::cluster_list::iterator sci=smallclu.begin(), end= smallclu.end() ; sci!=end; ++sci ){
+		for( Clusterer::cluster_list::iterator sci=smallclu.begin(), end0= smallclu.end() ; sci!=end0; ++sci ){
 		  for( Clusterer::cluster_type::iterator ci=(*sci)->begin(), end1= (*sci)->end() ; ci!=end1;++ci ){
 			seedhits.push_back( *ci ) ;
 		  }
@@ -930,7 +928,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 					  <<  " - found " << sclu.size() << " seed clusters "
 					  << std::endl ;
 
-		  for( Clusterer::cluster_list::iterator icv = sclu.begin(), end =sclu.end()  ; icv != end ; ++ icv ) {
+		  for( Clusterer::cluster_list::iterator icv = sclu.begin() ; icv != sclu.end() ; ++ icv ) {
 
 		int nHitsAdded = 0 ;
 
@@ -997,7 +995,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
   static const int do_global_reclustering = !pixelTPC ;
   if( do_global_reclustering ) {
 
-    outerRow = maxTPCLayers - 1 ;
+    int outerRow = maxTPCLayers - 1 ;
     
     int padRangeRecluster = 50 ; // FIXME: make parameter 
     // define an inner cylinder where we exclude hits from re-clustering:
