@@ -1,7 +1,7 @@
 #include "clupatra_new.h"
 #include <set>
 #include <vector>
-
+#include <algorithm>
 
 #include <UTIL/BitField64.h>
 #include "UTIL/LCTrackerConf.h"
@@ -21,7 +21,6 @@
 #include "DDSurfaces/Vector3D.h"
 #include "DD4hep/DD4hepUnits.h" 
 #include "DDRec/DetectorData.h"
-
 
 #include "gearimpl/Vector3D.h"
 
@@ -76,7 +75,221 @@ namespace clupatra_new{
   }
 
   //-------------------------------------------------------------------------------
-  
+
+  int addHitsAndFilterPixel( CluTrack* clu, HitListVector& hLV , double dChi2Max, double chi2Cut, unsigned maxStep, bool outwards,
+			MarlinTrk::IMarlinTrkSystem* trkSys ) {
+
+	  	  int nHitsAdded = 0 ;
+//	      static const double bfield = getDd4hepBField(); //static for performance reasons
+
+	      DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+	      DD4hep::Geometry::DetElement tpcDE = lcdd.detector("TPC") ;
+	      DD4hep::DDRec::FixedPadSizeTPCData* tpc = tpcDE.extension<DD4hep::DDRec::FixedPadSizeTPCData>() ;
+	      const int maxTPCLayerID  =  tpc->maxRow ;
+
+	      //we do not sort because order of hits is important for curlers
+	      //select starting layer
+	      ClupaHit* startingHit= outwards ?  clu->back()->first : clu->front()->first;
+	      int layer =  startingHit->layer ;
+	      if( layer <= 0  || layer >=  maxTPCLayerID   )
+	      	 return  nHitsAdded ;
+
+	      streamlog_out( DEBUG8 ) <<  " ======================  addHitsAndFilterHelix():  - layer " << layer << "  backward: " << outwards << std::endl  ;
+
+	      IMarlinTrack* trk =  clu->ext<MarTrk>() ;
+	      if(  trk == 0 ){
+	        streamlog_out( WARNING ) <<  "  addHitsAndFilter called with null pointer to MarlinTrk  - won't do anything " << std::endl ;
+	        return  nHitsAdded;
+	      }
+
+	      //setup conversion layerNumber -> layerID
+	      UTIL::BitField64 encoder( UTIL::LCTrackerCellID::encoding_string() ) ;
+	      encoder[UTIL::LCTrackerCellID::subdet()] = UTIL::ILDDetID::TPC ;
+
+	      //reverse track if necessary
+	      IMarlinTrack *fwTrk=trk, *bwTrk=0;
+	      if(trkSys && outwards //assume this is always necessary when using a outwards track
+	    		  ){
+	    	  auto smoothed = trk->smooth(startingHit->lcioHit);
+
+	          double chi2 ;
+	          int ndf  ;
+	          IMPL::TrackStateImpl trackState ;
+	          trk->getTrackState( startingHit->lcioHit , trackState, chi2,  ndf ) ;
+
+	          streamlog_out( DEBUG7 ) <<  "  -- addHitsAndFilter(): smoothed track segment : " <<  MarlinTrk::errorCode( smoothed )
+	    			      <<  " using track state : " <<   trackState
+	    			      <<  " ---- chi2: " << chi2
+	    			      <<  "  ndf " << ndf
+	    			      << std::endl ;
+
+
+	          bwTrk = trkSys->createTrack()  ;
+
+	          //need to add a dummy hit to the track
+	          bwTrk->addHit(  startingHit->lcioHit  ) ; // use the hit we smoothed back to
+
+	          // note: backward here is forward in the MarlinTrk sense, ie. in direction of energy loss
+	          bwTrk->initialise( trackState ,  0 ,  MarlinTrk::IMarlinTrack::forward ) ;
+
+	          trk=bwTrk;
+	      }
+
+
+	      double maxDistanceToPreviousHit=100; //fixme: make parameter
+	      int LayersPerStep = 25; //fixme: make parameter
+	      unsigned maxStepsWithoutIntersection=2;
+
+	      unsigned stepsWithoutHit = 0 , stepsSinceDirectionChange = 0, stepsWithoutIntersection = 0;
+	      int currentStepDirection = ( outwards ?  +1 : -1 );
+	      if(!outwards) layer-=LayersPerStep;
+
+	      ClupaHit* previousHit=startingHit;
+	      ClupaHit* firstHitAddedInRange=previousHit;
+	      bool atEndCap=false;
+
+	      while( stepsWithoutHit < maxStep and !atEndCap ) {
+
+	        int outerLayer=std::min(layer+LayersPerStep-1, maxTPCLayerID-1); //outer layer of current range
+	        int innerLayer=std::max(layer,0); //inner layer of current range
+	        if( outerLayer <= 0  || innerLayer >=  maxTPCLayerID   )
+	      	  break ;
+
+	        //layerID for intersection
+	        encoder[ UTIL::LCTrackerCellID::layer()  ] = layer ;
+	        int layerID = encoder.lowWord() ;
+
+	        bool hitAdded = false ;
+
+	        gear::Vector3D intersectionPoint ;
+	        int elementID = 0 ;
+	        int intersects = -1  ;
+	        intersects  = trk->intersectionWithLayer( layerID, intersectionPoint, elementID , IMarlinTrack::modeClosest )  ;
+
+	        streamlog_out( DEBUG3 ) <<  "  -- addHitsAndFilter(): looked for intersection - "
+	  			     <<  "  Step : " << stepsWithoutHit
+	  			     <<  "  at layer range: ["<<innerLayer<<" - "<<outerLayer<<"]"
+	  			     <<  "   intersects : " << MarlinTrk::errorCode( intersects )
+	  			     <<  "  next xing point : " <<  intersectionPoint  ;
+
+	        // if found a crossing point
+	        if( intersects != IMarlinTrack::success ) {  // no intersection found
+	        	  double zTreshold=10;
+	        	  if( std::fabs(previousHit->pos.z()) > tpc->zHalf*10-zTreshold) {
+	        		  streamlog_out(DEBUG8) << "addHitsAndFilter(): no intersection found, ending after current step because finder reached end-plate: "<<tpc->zHalf<<std::endl;
+	        		  atEndCap=true;
+	        	  } else if(stepsSinceDirectionChange<=1 || !nHitsAdded) { //just change direction and still no intersection! Or no hits added at all yet
+					  // we stop searching here
+					  streamlog_out(DEBUG8) << "addHitsAndFilter(): no intersection found, ending search.. (added "<<nHitsAdded<<" hits)"<<std::endl;
+					  break;
+				  } else {
+					  //try to reverse the step direction
+					  currentStepDirection*=-1;
+					  stepsSinceDirectionChange = 0;
+					  stepsWithoutIntersection=0;
+//					  maxDistanceToPreviousHit=50;
+					  outerLayer=std::min(layer+4*LayersPerStep-1, maxTPCLayerID-1);
+					  streamlog_out(DEBUG8)<<"addHitsAndFilter(): reversing direction after current step"<<std::endl;
+				  }
+				  intersectionPoint=gear::Vector3D(0,0,0);
+	        }
+
+			//find hits in layers
+			HitVec hitVecOfLayer=getHitsInRowRange(innerLayer,outerLayer,hLV);
+			streamlog_out( DEBUG3 ) <<  "      -- number of hits on layer range ["<<innerLayer<<" - "<<outerLayer<<"] : " << hitVecOfLayer.size() << std::endl ;
+
+			//sort by distance to first added hit in last range
+//			CLHEP::Hep3Vector lastHitPos=firstHitAddedInRange->pos;
+//			std::sort(hitVecOfLayer.begin(), hitVecOfLayer.end(),
+//					[&lastHitPos] (Hit* a, Hit* b) {
+//						return (a->first->pos-lastHitPos).r2() < (b->first->pos-lastHitPos).r2() ;
+//					} );
+
+			//sort by z
+			std::sort(hitVecOfLayer.begin(), hitVecOfLayer.end(),
+					[&outwards] (Hit* a, Hit* b) {
+						return outwards ?
+								std::fabs(a->first->pos.z()) < std::fabs(b->first->pos.z()) :
+								std::fabs(a->first->pos.z()) > std::fabs(b->first->pos.z()) ;
+					} );
+
+			double closestHit=10000;
+			//loop over hits
+			for( auto ih = hitVecOfLayer.begin(), end = hitVecOfLayer.end() ; ih != end ; ih++ ){
+				Hit* currentClustHit=*ih;
+
+				closestHit=std::min(closestHit, (currentClustHit->first->pos - previousHit->pos).r() );
+
+				if( (currentClustHit->first->pos - previousHit->pos).r() < maxDistanceToPreviousHit /*mm*/ ){ //cut on distance to previously added hit!
+
+				  const gear::Vector3D&  hPos = currentClustHit->first->pos  ;
+
+				  double deltaChi = 0. ;
+				  int addHit =  trk->addAndFit( currentClustHit->first->lcioHit, deltaChi, dChi2Max )  ;
+
+				  //print debug info
+				  if(currentStepDirection != (outwards ?  +1 : -1) ) {//is direction reversed?
+					  streamlog_out( DEBUG7 ) <<   " *****       assigning hit " <<nHitsAdded<<" : " << errorCode( addHit )  << hPos //<< " <-> " << xv
+								<<   " dist to previous hit: " <<  (  hPos - previousHit->pos ).r()
+								<<   " dist to intersect: " << (hPos - intersectionPoint).r()
+								<<   " chi2: " <<  0 //chiAtHit
+								<<   "  hit errors : { ";
+					  for(int i=0; i<6; i++) streamlog_out(DEBUG7) << sqrt( currentClustHit->first->lcioHit->getCovMatrix()[i] ) << (i==5 ? " }" : ", ");
+					  if(addHit!=IMarlinTrack::site_discarded ) streamlog_out( DEBUG7 ) <<   "----- deltaChi = " << deltaChi<< std::endl ;
+					  else streamlog_out(DEBUG7)<<std::endl;
+				  }
+
+				  if( addHit  == IMarlinTrack::success ) {
+//						  //remove element and set to the element before
+					  hLV.at(currentClustHit->first->layer).remove(currentClustHit);
+
+					  if(outwards) {
+						  //add to back
+						  //addElementBack:
+						  clu->addElement( currentClustHit ) ;
+					  } else {
+						  //equivalent but at front instead!
+						  //addElementFront:
+						  currentClustHit->second=clu;
+						  clu->push_front( currentClustHit ) ;
+					  }
+
+					  previousHit=currentClustHit->first;
+					  if(!hitAdded) firstHitAddedInRange=currentClustHit->first;
+
+					  hitAdded = true ;
+					  ++nHitsAdded ;
+
+					  streamlog_out( DEBUG ) <<   " ---- track state filtered with new hit ! ------- " << std::endl ;
+				  } else {
+					  streamlog_out( DEBUG4 ) << " could not add hit because status " << errorCode( addHit ) <<std::endl;
+				  }
+			  }//chi2cut
+			}// loop over hits in layer -------------------------------------------------------------------
+			if(!hitAdded) {
+				streamlog_out(DEBUG8)<<"Did find intersection but did not add hits from layer range ["<<innerLayer<<" - "<<outerLayer<<") with "<<hitVecOfLayer.size()<<" hits"<<std::endl;
+				if(hitVecOfLayer.size()) streamlog_out(DEBUG8)<<"closest hit at "<<closestHit<<std::endl;
+			}
+
+	  	    // reset the step or increment it
+	  	    stepsWithoutHit = (  hitAdded  ?  0 :  stepsWithoutHit + 1 ) ;
+	  	    ++stepsSinceDirectionChange;
+
+	        //layer starts at begin or end
+	        layer +=  currentStepDirection*LayersPerStep ;
+
+	  	} // while step < maxStep
+
+	    if(bwTrk && nHitsAdded) {//if backward and hitsadded, replace forward track with new one
+	    	clu->ext<MarTrk>()=bwTrk;
+	       delete fwTrk;
+	    } else {
+	    	//else leave the forward one
+	       delete bwTrk;
+	    }
+
+	  	return nHitsAdded ;
+  }
 
   int addHitsAndFilter( CluTrack* clu, HitListVector& hLV , double dChi2Max, double chi2Cut, unsigned maxStep, ZIndex& zIndex, bool backward, 
 			MarlinTrk::IMarlinTrkSystem* trkSys ) {
@@ -506,7 +719,49 @@ namespace clupatra_new{
     }
   }
 
+int getNumberOfHitsIn(MarlinTrk::IMarlinTrack& trk) {
+    std::vector<std::pair<EVENT::TrackerHit*, double> > hitsInFit ;
+    trk.getHitsInFit( hitsInFit ) ;
+    return hitsInFit.size();
+}
+
   //------------------------------------------------------------------------------------------------------------------------- 
+
+DDSurfaces::Vector3D CalculateAveragePosition(const Clusterer::cluster_type& clus ) {
+	DDSurfaces::Vector3D average(0,0,0);
+	for(const Clusterer::element_type* h : clus) {
+		average=average+h->first->pos;
+	}
+	return (1./clus.size()) * average ; //CLHEP::ThreeVector did have /=
+}
+
+clupatra_new::Clusterer::cluster_type cutHitsFromCluster(
+		clupatra_new::Clusterer::cluster_type& cluster,
+		double phi,
+		double dsCut,
+		double drzCut) {
+	  DDSurfaces::Vector3D average=CalculateAveragePosition(cluster);
+	  //put cut around straight track in phi
+	  cluster.remove_if(
+		[&average, phi, dsCut](Clusterer::element_type* hit)->bool {
+		  DDSurfaces::Vector3D vec=hit->first->pos-average;
+		  return std::fabs( vec.x()*sin(phi) - vec.y()*cos(phi) ) > dsCut;
+	    }
+	  );
+	  streamlog_out(DEBUG8)<<"After cut in phi cluster has size "<<cluster.size()<<std::endl;
+	  if(cluster.empty()) return cluster;
+
+	  //put cut around straight track in theta
+	  cluster.remove_if(
+		[&average, drzCut](Clusterer::element_type* hit)->bool {
+		  DDSurfaces::Vector3D vec=hit->first->pos-average;
+		  return std::fabs( vec.z()*sin(average.theta()) - vec.r()*cos(average.theta()) ) > drzCut;
+	  	}
+	  );
+	  streamlog_out(DEBUG8)<<"After cut in theta cluster has size "<<cluster.size()<<std::endl;
+	  return cluster;
+}
+
 
   void create_n_clusters( Clusterer::cluster_type& hV, Clusterer::cluster_list& cluVec , unsigned n ) {
     
@@ -1013,12 +1268,15 @@ namespace clupatra_new{
       return trk ;
     }
     
+    //add MarTrk to cluster
     clu->ext<MarTrk>() = trk ;
     
+    //sort layers, lowest layer first
     clu->sort( LayerSortOut() ) ;
     
     // need to reverse the order for incomming track segments (curlers)
     // assume particle comes from IP
+    // reverse_order=true => front.z > back.z => hits are added outwards
     Hit* hf = clu->front() ;
     Hit* hb = clu->back() ;
     
@@ -1069,7 +1327,7 @@ namespace clupatra_new{
     std::vector<std::pair<EVENT::TrackerHit*, double> > hitsInFit ;
     trk->getHitsInFit( hitsInFit ) ;
 
-    if( isFirstFit  && ( 1.*hitsInFit.size()) / (1.*nHit )  <  0.2  ) {  // fixme: parameter  
+    if( isFirstFit  && ( 1.*hitsInFit.size()) / (1.*nHit )  <  0.2 ) {  // fixme: parameter
       
       isFirstFit = false ;
       
@@ -1083,45 +1341,104 @@ namespace clupatra_new{
     }
     //----------------------------------------------------------------------
 
+    streamlog_out( DEBUG9 ) << " IMarlinTrkFitter: number of hits used in fit is now: " << hitsInFit.size()<< std::endl;
+    return trk;
+  }
+
+
+  MarlinTrk::IMarlinTrack* IMarlinTrkFitter::operator() (CluTrack* clu, const TrackState& trackState) {
+	    // need to reverse the order for incoming track segments (curlers)
+	    // assume particle comes from IP
+	    // reverse order=true => front.z > back.z
+	    Hit* frontHit = clu->front() ;
+	    Hit* backHit = clu->back() ;
+
+	    bool reverse_order =   ( std::abs( frontHit->first->pos.z() ) > std::abs( backHit->first->pos.z()) + 3. ) ;
+	    streamlog_out( DEBUG8 )<<"IMarlinTrkFitter::operator() reverse order = "<<reverse_order<<std::endl;
+
+	    return operator()(clu, trackState, reverse_order);
+  }
+
+  //todo: check direction!
+  MarlinTrk::IMarlinTrack* IMarlinTrkFitter::operator() (CluTrack* clu, const TrackState& trackState, bool reverse_order /*normal order is outwards, reverse is inwards*/ ) {
+
+//    bool isFirstFit = true ;
+    double maxChi2  =  _maxChi2Increment   ;
+    double bField = 0;//getDd4hepBField();//this value is not in use
+
+    MarlinTrk::IMarlinTrack* trk = _ts->createTrack();
+
+    //if( clu->empty()  ){
+    if( clu->size() < 3  ){
+      streamlog_out( ERROR ) << " IMarlinTrkFitter::operator() : cannot fit cluster track with less than 3 hits ! " << std::endl ;
+      return trk ;
+    }
+
+    //add MarTrk to cluster
+    clu->ext<MarTrk>() = trk ;
+
+    //we have ascending layernumbers, lowest layer first
+//    clu->sort( LayerSortOut() ) ;//This will cause ascending layernumber
+
+    unsigned nHit = 0 ;
+
+    if( reverse_order ){
+//      if(!isFirstFit) { this was a small trial to check if this would help any. It does help in a few cases, but even with this cases where the track goes in the wrong direction remain.
+//    	  trk->addHit( clu->front()->first->lcioHit );
+//    	  clu->pop_front();
+//      }
+    	//start at end=highest layernumber, adding inwards
+      for( auto it=clu->begin() ; it != clu->end() ; ++it){
+		trk->addHit( (*it)->first->lcioHit  ) ;
+		++nHit ;
+		streamlog_out( DEBUG1 ) <<  "   hit  added  " <<  *(*it)->first->lcioHit   << std::endl ;
+      }
+      //hits are now outwards inside track
+
+      trk->initialise(trackState, bField/*is not used*/, MarlinTrk::IMarlinTrack::forward ) ; //this is with the loss of energy = forwards
+
+    } else {
+//      if(!isFirstFit) {
+//    	  trk->addHit( clu->back()->first->lcioHit );
+//    	  clu->pop_back();
+//      }
+    	//start at begin=lowest layernumber, adding outwards
+      for( CluTrack::reverse_iterator it=clu->rbegin() ; it != clu->rend() ; ++it){
+
+		trk->addHit( (*it)->first->lcioHit   ) ;
+		++nHit ;
+
+		streamlog_out( DEBUG1 ) <<  "   hit  added  "<<  *(*it)->first->lcioHit   << std::endl ;
+      }
+
+      trk->initialise(trackState, bField, MarlinTrk::IMarlinTrack::backward ) ; //start against the loss of energy = backwards
+    }
+
+
+    int code = trk->fit(  maxChi2  ) ;
+
+    if( code != MarlinTrk::IMarlinTrack::success ){
+
+      streamlog_out( ERROR ) << "  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> IMarlinTrkFitter :  problem fitting track "
+			     << " error code : " << MarlinTrk::errorCode( code )
+			     << std::endl ;
+
+    }
+
+    std::vector<std::pair<EVENT::TrackerHit*, double> > hitsInFit ;
+    trk->getHitsInFit( hitsInFit ) ;
+    //----------------------------------------------------------------------
+
+    streamlog_out( DEBUG9 ) << " IMarlinTrkFitter: number of hits used in fit is now: " << hitsInFit.size()<< std::endl;
     return trk;
   }
   
   
   //---------------------------------------------------------------------------------------------------------------------------
+  lcio::TrackImpl* LCIOTrackConverter::addProperties(MarlinTrk::IMarlinTrack * mtrk,
+ 		lcio::TrackImpl* trk)  {
 
-   lcio::Track* LCIOTrackConverter::operator() (CluTrack* c) {  
-    
-    static lcio::BitField64 encoder( lcio::LCTrackerCellID::encoding_string() ) ; 
-
-    lcio::TrackImpl* trk = new lcio::TrackImpl ;
-
-    trk->setTypeBit( lcio::ILDDetID::TPC ) ; 
-   
-    double e = 0.0 ;
-    int nHit = 0 ;
-    for( CluTrack::iterator hi = c->begin(); hi != c->end() ; hi++) {
-      
-      // reset outliers (not used in fit)  bit
-      //      IMPL::TrackerHitImpl* thi = dynamic_cast<IMPL::TrackerHitImpl*> (  (*hi)->first->lcioHit )  ;
-      //      thi->setQualityBit( UTIL::ILDTrkHitQualityBit::USED_IN_FIT , 0 )  ;
-
-      trk->addHit(  (*hi)->first->lcioHit ) ;
-      e += (*hi)->first->lcioHit->getEDep() ;
-      nHit++ ;
-    }
-
-    MarlinTrk::IMarlinTrack* mtrk = c->ext<MarTrk>()  ;
-
-    trk->ext<MarTrk>()  = mtrk ;
-
-    trk->setdEdx( ( nHit ? e/nHit : -1. )  ) ;
-    trk->subdetectorHitNumbers().resize( 2 * lcio::ILDDetID::ETD ) ;
-
-    trk->subdetectorHitNumbers()[ 2*lcio::ILDDetID::TPC - 2 ] =  0 ; 
-    trk->subdetectorHitNumbers()[ 2*lcio::ILDDetID::TPC - 1 ] =  nHit ;  
-      
-    if( mtrk != 0 && ! c->empty() ){
-      
+      static lcio::BitField64 encoder( lcio::LCTrackerCellID::encoding_string() ) ;
 
       std::vector<std::pair<EVENT::TrackerHit*, double> > hitsInFit ;
       mtrk->getHitsInFit( hitsInFit ) ;
@@ -1275,8 +1592,46 @@ namespace clupatra_new{
 
       } else {
 
-	streamlog_out( WARNING ) << "  >>>>>>>>>>> LCIOTrackConverter::operator()  -  hitsInFitEmpty ! - nHits " << nHit << std::endl ;
+	streamlog_out( WARNING ) << "  >>>>>>>>>>> LCIOTrackConverter::operator()  -  hitsInFitEmpty ! " << std::endl ;
       }
+
+      return trk;
+  }
+
+
+   lcio::Track* LCIOTrackConverter::operator() (CluTrack* c) {
+
+
+    lcio::TrackImpl* trk = new lcio::TrackImpl ;
+
+    trk->setTypeBit( lcio::ILDDetID::TPC ) ;
+
+    double e = 0.0 ;
+    int nHit = 0 ;
+    for( CluTrack::iterator hi = c->begin(); hi != c->end() ; hi++) {
+
+      // reset outliers (not used in fit)  bit
+      //      IMPL::TrackerHitImpl* thi = dynamic_cast<IMPL::TrackerHitImpl*> (  (*hi)->first->lcioHit )  ;
+      //      thi->setQualityBit( UTIL::ILDTrkHitQualityBit::USED_IN_FIT , 0 )  ;
+
+      trk->addHit(  (*hi)->first->lcioHit ) ;
+      e += (*hi)->first->lcioHit->getEDep() ;
+      nHit++ ;
+    }
+
+    MarlinTrk::IMarlinTrack* mtrk = c->ext<MarTrk>()  ;
+
+    trk->ext<MarTrk>()  = mtrk ;
+
+    trk->setdEdx( ( nHit ? e/nHit : -1. )  ) ;
+    trk->subdetectorHitNumbers().resize( 2 * lcio::ILDDetID::ETD ) ;
+
+    trk->subdetectorHitNumbers()[ 2*lcio::ILDDetID::TPC - 2 ] =  0 ;
+    trk->subdetectorHitNumbers()[ 2*lcio::ILDDetID::TPC - 1 ] =  nHit ;
+
+    if( mtrk != 0 && ! c->empty() ){
+
+    	trk=addProperties(mtrk, trk);
       
     } else {
       
@@ -1287,6 +1642,45 @@ namespace clupatra_new{
     
 
     return trk ;
+  }
+
+
+   lcio::Track* LCIOTrackConverter::operator() (MarlinTrk::IMarlinTrack* mtrk) {
+
+    lcio::TrackImpl* lciotrk = new lcio::TrackImpl ;
+    lciotrk->setTypeBit( lcio::ILDDetID::TPC ) ;
+
+    double e = 0.0 ;
+    int nHit = 0 ;
+	std::vector<std::pair<EVENT::TrackerHit*, double> > hitsInFit;
+	mtrk->getHitsInFit(hitsInFit);
+    for( auto HitChiPair : hitsInFit) {
+      lcio::TrackerHit* lciohit= HitChiPair.first;
+      lciotrk->addHit(  lciohit ) ;
+      e += lciohit->getEDep() ;
+      nHit++ ;
+    }
+
+    lciotrk->ext<MarTrk>()  = mtrk ;
+
+    lciotrk->setdEdx( ( nHit ? e/nHit : -1. )  ) ;
+    lciotrk->subdetectorHitNumbers().resize( 2 * lcio::ILDDetID::ETD ) ;
+
+    lciotrk->subdetectorHitNumbers()[ 2*lcio::ILDDetID::TPC - 2 ] =  0 ;
+    lciotrk->subdetectorHitNumbers()[ 2*lcio::ILDDetID::TPC - 1 ] =  nHit ;
+
+    if( mtrk != 0 && nHit ){
+
+    	lciotrk=addProperties(mtrk, lciotrk);
+
+    } else {
+
+      // this is not an error  for debug collections that just consist of track hits (no fit )
+      // streamlog_out( ERROR ) << "  >>>>>>>>>>> LCIOTrackConverter::operator() (CluTrack* c)  :  "
+      // 			     << " no MarlinTrk::IMarlinTrack* found for cluster !!?? " << std::endl ;
+    }
+
+    return lciotrk ;
   }
 
 

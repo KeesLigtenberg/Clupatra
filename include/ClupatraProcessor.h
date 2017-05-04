@@ -1,11 +1,13 @@
 #ifndef ClupatraProcessor_h
 #define ClupatraProcessor_h 1
 
-//#include "assert.h"
+#include <string>
+#include <cassert>
 
 #include "marlin/Processor.h"
-
 #include "lcio.h"
+
+#include "clupatra_new.h"
 
 #include "DDRec/DetectorData.h"
 
@@ -117,7 +119,7 @@ class ClupatraProcessor : public marlin::Processor {
   std::string _vxdColName ;
   std::string _sitColName ;
   std::string _outColName ;
-  std::string  _segmentsOutColName ;
+  std::string _segmentsOutColName ;
 
   float _distCut ;
   float _cosAlphaCut ;
@@ -126,6 +128,7 @@ class ClupatraProcessor : public marlin::Processor {
   float _bfield ;
   
   float  _dChi2Max ;
+  float  _dChi2MaxRefit;
   float  _chi2Cut ;
   int    _maxStep ; 
 

@@ -3,11 +3,11 @@
 
 #include <cmath>
 #include <algorithm>
-#include <time.h>
-#include <math.h>
+#include <ctime>
+#include <cmath>
 #include <sstream>
 #include <memory>
-#include "assert.h"
+#include <cassert>
 
 #include "NNClusterer.h"
 
@@ -24,6 +24,7 @@
 #include "UTIL/LCTrackerConf.h"
 #include <UTIL/ILDConf.h>
 
+#include "CLHEP/Vector/ThreeVector.h"
 
 #include "MarlinTrk/IMarlinTrack.h"
 #include "MarlinTrk/IMarlinTrkSystem.h"
@@ -102,6 +103,71 @@ namespace clupatra_new{
   struct DChi2 : lcrtrel::LCFloatExtension<DChi2> {} ; 
 
   //----------------------------------------------------------------
+
+  struct TrkState : lcrtrel::LCExtension<TrkState, IMPL::TrackStateImpl> {} ;
+
+  //------------------------------------------------------------------------------------------
+
+
+	/** helper method to get hits in row range in a single vector from the HitListVector
+	 *	includes both innerRow and outerRow. 
+	 */
+	template<class HitContainer=HitVec>
+	HitContainer getHitsInRowRange(int innerRow, int outerRow, const HitListVector& hitsInLayer) {
+		//count number of elements
+		int nHit=0;
+		for (int iRow = outerRow; iRow >= innerRow && iRow >= 0  ; --iRow) { nHit+=hitsInLayer[ iRow ].size(); }
+		HitContainer hitsInRowRange;
+//		hitsInRowRange.reserve(nHit); leaving this out should be a negligible performance penalty
+		// add all hits in pad row range to hits
+		for (int iRow = outerRow; iRow >= innerRow && iRow >= 0  ; --iRow) {
+			streamlog_out( DEBUG0 )<< "  copy " << hitsInLayer[ iRow ].size() << " hits for row " << iRow << std::endl;
+			std::copy(hitsInLayer[iRow].begin(), hitsInLayer[iRow].end(), std::back_inserter(hitsInRowRange));
+		}
+		return hitsInRowRange;
+	}
+
+
+	/**helper method to get hits in row range in two vectors from the HitListVector
+	 * the two vectors are sorted by ascending row number
+	 */
+	inline
+	std::vector<HitVec> getHitsInRowRangeBySide(int outerRow, int padRowRange, const HitListVector& hitsInLayer) {
+		//count number of elements
+		int nHit=0;
+		for (int iRow = outerRow; iRow > (outerRow - padRowRange) && iRow > -1 ; --iRow) { nHit+=hitsInLayer[ iRow ].size(); }
+		HitVec hitsOnPositive, hitsOnNegative;
+		hitsOnPositive.reserve(nHit);
+		hitsOnNegative.reserve(nHit);
+		// add all hits in pad row range to hits
+		for (int iRow = (outerRow - padRowRange)+1; iRow <= outerRow ; ++iRow) {
+			if (iRow > -1) {
+				streamlog_out( DEBUG0 )<< "  copy " << hitsInLayer[ iRow ].size() << " hits for row " << iRow << std::endl;
+				for(auto& h : hitsInLayer[iRow] ) {
+					if( h->first->pos.z() < 0 ) {
+						//negative side
+						hitsOnNegative.push_back(h);
+					} else {
+						//positive side
+						hitsOnPositive.push_back(h);
+					}
+				}
+			}
+		}
+		hitsOnPositive.shrink_to_fit();
+		hitsOnNegative.shrink_to_fit();
+		return {hitsOnNegative, hitsOnPositive};
+	}
+
+	/**	Get number of hits in a HitListVector
+	 */
+	inline int getNumberOfHits(const HitListVector& hitsInLayer) {
+		int n=0;
+		for (int i=0; i<hitsInLayer.size(); i++) { n+=hitsInLayer[i].size(); }
+		return n;
+	}
+
+	int getNumberOfHitsIn(MarlinTrk::IMarlinTrack& trk);
 
   /** Simple predicate class for computing an index from N bins of the z-coordinate of LCObjects
    *  that have a float/double* getPostion() method.
@@ -227,8 +293,11 @@ namespace clupatra_new{
 			   CaloFaceEndcapID( lcio::ILDDetID::ECAL_ENDCAP){} 
 
     lcio::Track* operator() (CluTrack* c) ;
+    lcio::Track* operator() (MarlinTrk::IMarlinTrack* mtrk);
 
-  } ;
+protected:
+    lcio::TrackImpl* addProperties(MarlinTrk::IMarlinTrack * mtrk, lcio::TrackImpl* lciotrk);
+};
 
   //------------------------------------------------------------------------------------------
   /** Predicate class for identifying small clusters. */
@@ -294,6 +363,8 @@ namespace clupatra_new{
     
 
     MarlinTrk::IMarlinTrack* operator() (CluTrack* clu) ;
+    MarlinTrk::IMarlinTrack* operator() (CluTrack* clu, const TrackState&) ;
+    MarlinTrk::IMarlinTrack* operator() (CluTrack* clu, const TrackState&, bool inwards) ;
   };
 
   //-------------------------------------------------------------------------------------
@@ -302,9 +373,9 @@ namespace clupatra_new{
    *  Hits are added if the resulting delta Chi2 is less than dChiMax - a maxStep is the maximum number of steps (layers) w/o 
    *  successfully merging a hit.
    */
-  int addHitsAndFilter( CluTrack* clu, HitListVector& hLV , double dChiMax, double chi2Cut, unsigned maxStep, ZIndex& zIndex,  bool backward=false, 
-			MarlinTrk::IMarlinTrkSystem* trkSys=0) ; 
-  //------------------------------------------------------------------------------------------
+  int addHitsAndFilter( CluTrack* clu, HitListVector& hLV , double dChiMax, double chi2Cut, unsigned maxStep, ZIndex& zIndex,  bool backward=false,	MarlinTrk::IMarlinTrkSystem* trkSys=0) ;
+  int addHitsAndFilterPixel( CluTrack* clu, HitListVector& hLV , double dChi2Max, double chi2Cut, unsigned maxStep, bool backward=false, MarlinTrk::IMarlinTrkSystem* trkSys=nullptr );
+//------------------------------------------------------------------------------------------
   
   /** Try to add a hit from the given HitList in layer of subdetector to the track.
    *  A hit is added if the resulting delta Chi2 is less than dChiMax.
@@ -323,6 +394,20 @@ namespace clupatra_new{
   void getHitMultiplicities( CluTrack* clu, std::vector<int>& mult ) ;
 
   //------------------------------------------------------------------------------------------
+
+
+  /** Calculate average position of all hits in cluster
+   */
+  DDSurfaces::Vector3D CalculateAveragePosition(const Clusterer::cluster_type& clus );
+
+  /** Cut hits from cluster in the xy plane by dsCut, and in rz plane by drzCut
+   */
+  clupatra_new::Clusterer::cluster_type cutHitsFromCluster(
+  		clupatra_new::Clusterer::cluster_type& cluster,
+  		double phi,
+  		double dsCut,
+  		double drzCut );
+
 
   /** Split the cluster into two clusters.
    */
@@ -575,21 +660,27 @@ namespace clupatra_new{
       float epsilon = 0. ; 
       if(  ti0->zAvg > ti1->zAvg ){
 	
-      	if( ti1->zMax > ( ti0->zMin + epsilon )  )
-      	  return false ;
+      	if( ti1->zMax > ( ti0->zMin + epsilon )  ) {
+      		streamlog_out(DEBUG0)<<"tracks overlap"<<std::endl;
+        	return false ;
+      	}
 	
       } else {
 	
-      	if( ti0->zMax > ( ti1->zMin + epsilon ) )
-      	  return false ;
+      	if( ti0->zMax > ( ti1->zMin + epsilon ) ){
+    		streamlog_out(DEBUG0)<<"tracks overlap"<<std::endl;
+    		return false ;
+    	}
 	
       }
       
       double tl0 = std::abs( trk0->getTanLambda() ) ;
       double tl1 = std::abs( trk1->getTanLambda() ) ;
       
-      if( trk0->getTanLambda() * trk1->getTanLambda()   < 0. ) 
-	return false ; // require the same sign
+      if( trk0->getTanLambda() * trk1->getTanLambda()   < 0. )  {
+    	  streamlog_out(DEBUG0) << "tracks do not have same sign!"<<std::endl;
+    	  return false ; // require the same sign
+      }
 
 
       double dtl = 2. * std::abs( tl0 - tl1 ) / ( tl0 + tl1 ) ;

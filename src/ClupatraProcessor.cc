@@ -2,12 +2,11 @@
 
 #include "clupatra_new.h"
 
-#include <time.h>
+#include <ctime>
 #include <vector>
 #include <map>
 #include <set>
 #include <algorithm>
-#include <math.h>
 #include <cmath>
 #include <memory>
 #include <float.h>
@@ -45,6 +44,8 @@
 #include "MarlinTrk/IMarlinTrkSystem.h"
 #include "MarlinTrk/MarlinTrkUtils.h"
 
+//helper class for hough-like track finding
+#include "PhiHistogram.h"
 
 using namespace lcio ;
 using namespace marlin ;
@@ -305,6 +306,11 @@ ClupatraProcessor::ClupatraProcessor() : Processor("ClupatraProcessor") ,
   // 			      _rCut ,
   // 			      (float) 0.0 ) ;
   
+  registerProcessorParameter( "MaxDeltaChi2Refit" ,
+ 			      "the maximum delta Chi2 for which a hit is added to a track segement in the refit"  ,
+ 			      _dChi2MaxRefit ,
+ 			      (float) 35. ) ;
+
   registerProcessorParameter( "MaxDeltaChi2" , 
  			      "the maximum delta Chi2  after filtering for which a hit is added to a track segement"  ,
  			      _dChi2Max ,
@@ -455,6 +461,55 @@ void ClupatraProcessor::processRunHeader( LCRunHeader* ) {
 } 
 
 
+
+HitListVector& removeHitsFromHitListVector(Clusterer::cluster_type& clus, HitListVector &hitsInLayer) {
+	  for( Clusterer::cluster_type::iterator ci=clus.begin(), end=clus.end() ; ci!=end;++ci ){
+		  // this is not cheap ...
+		  streamlog_out(DEBUG1)<<"layer: "<<(*ci)->first->layer<<std::endl;
+		  hitsInLayer[ (*ci)->first->layer ].remove( *ci )  ;
+	  }
+	  return hitsInLayer;
+}
+
+DDSurfaces::Vector3D CalculateRMS( const Clusterer::cluster_type& clus, const DDSurfaces::Vector3D& average) {
+	DDSurfaces::Vector3D rms(0,0,0);
+	for(const Clusterer::element_type* h : clus) {
+		for(int i=0;i<3;i++) {
+			double veci=h->first->pos[i]-average[i];
+			rms[i]+=veci*veci;
+		}
+	}
+	for(int i=0;i<3;i++) rms[i]=sqrt(rms[i]);
+	return rms;
+}
+DDSurfaces::Vector3D CalculateRMS( const Clusterer::cluster_type& clus) {
+	return CalculateRMS(clus, CalculateAveragePosition(clus));
+}
+
+TrackStateImpl MakeTrackStateFromHits(const Clusterer::cluster_type& clus) {
+		DDSurfaces::Vector3D average=CalculateAveragePosition(clus);
+		streamlog_out(DEBUG8) << "average is "<<average<<std::endl;
+		const float originReference[3] = { float(average.x()) ,float(average.y()) ,float(average.z()) }; //reference point is average
+		const float d0error=1, //set a large d0 error
+				phierror=1e-2,
+				omegaerror=25e-8, //=5e-4
+				z0error=1,
+				tanlambdaerror=1,
+				unknown=0.; //set unknowns to zero after the 3-fit method
+		return TrackStateImpl(EVENT::TrackState::AtOther, /*location*/
+				0., /*d0*/
+				average.phi(), /*phi0*/
+				1E-5, /*omega*/
+				0., /*z0*/
+				1/tan(average.theta()), /*tanLambda*/
+				{ d0error,
+				  unknown, phierror,
+				  unknown, unknown, omegaerror,
+				  unknown, unknown, unknown, z0error,
+				  unknown, unknown, unknown, unknown, tanlambdaerror }, /*covMatrix*/
+				originReference ); /*reference*/
+}
+
 void ClupatraProcessor::processEvent( LCEvent * evt ) { 
   
   //  clock_t start =  clock() ; 
@@ -470,7 +525,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
   timer.start() ;
   
   // the clupa wrapper hits that hold pointers to LCIO hits plus some additional parameters
-  // create them in a vector for convenient memeory mgmt 
+  // create them in a vector for convenient memory mgmt
   std::vector<ClupaHit> clupaHits ;
   
   // on top of the clupahits we need the tiny wrappers for clustering - they are created on the heap
@@ -493,6 +548,9 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
   DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
   DD4hep::Geometry::DetElement tpcDE = lcdd.detector("TPC") ;
   _tpc = tpcDE.extension<DD4hep::DDRec::FixedPadSizeTPCData>() ;
+  const std::string TPCReadoutType= lcdd.constantAsString("TPC_readoutType");
+  const bool pixelTPC = (TPCReadoutType=="pixel");
+  
 
   double bfieldV[3] ;
   lcdd.field().magneticField( { 0., 0., 0. }  , bfieldV  ) ;
@@ -620,7 +678,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
   // first main step of clupatra:
   //   * cluster in pad row range - starting from the outside - to find clean cluster segments
   //   * extend the track segments with best matching hits, based on extrapolation to next layer(s)
-  //   * add the hits and apply a Kalman filter step ( track segement is always best estimate )
+  //   * add the hits and apply a Kalman filter step ( track segment is always best estimate )
   //   * repeat in backward direction ( after smoothing back, to get a reasonable track 
   //     state for extrapolating backwards )
   //===============================================================================================
@@ -631,177 +689,305 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
   
   nnclu::PtrVector<MarlinTrk::IMarlinTrack> seedTrks ;
   seedTrks.setOwner() ; // memory mgmt - will delete MarlinTrks at the end
-  
-  IMarlinTrkFitter fitter( _trksystem ) ;
+  IMarlinTrkFitter fitter( _trksystem, pixelTPC ? _chi2Cut : DBL_MAX ) ;
+
+  if(pixelTPC) { //phibinning transform
+	  //loop inwards
+	  for(int outerRow=maxTPCLayers-1; outerRow>=_padRowRange; outerRow-=_padRowRange) {
+
+		  //get hits in row range from full vector
+		  int nHitsLeftInHitList=getNumberOfHits(hitsInLayer);
+		  streamlog_out( DEBUG8 ) << std::endl << "total number of hits in hitListVector: "<<nHitsLeftInHitList<<std::endl;
+		  if(nHitsLeftInHitList<_minCluSize) break;
+		  streamlog_out( DEBUG8 ) <<  "copy hits in row range "<<outerRow<<"+"<<_padRowRange<<" to vectors"<<std::endl;
+		  auto hitsInRowRangeBySide= getHitsInRowRangeBySide(outerRow,_padRowRange, hitsInLayer); //ascending
+
+		  //for each side
+		  for(auto& hitsInRowRange : hitsInRowRangeBySide ) {
+		  //while a maximum can be be found
+
+			  //if not enough hits
+			  if(hitsInRowRange.size() < _minCluSize ) { streamlog_out( DEBUG8 ) << "continue because not enough hits in row range"<<std::endl; continue;}
+
+			  //make histogram
+			  PhiHistogram phiTrackFinder(600); //fixme: make number of bins parameter
+
+			  //fill phi bins
+			  streamlog_out(DEBUG8)<<"fill phi histogram  with "<< hitsInRowRange.size()<<" hits"<<std::endl;
+			  for(Hit* h : hitsInRowRange) {
+				  streamlog_out(DEBUG0)<<"hit at "<<h->first->pos<<std::endl;
+				  phiTrackFinder.Fill(h);
+			  }
+
+			  //if no maximum found break
+			  streamlog_out(DEBUG8)<<"largest maximum in histogram is "<<phiTrackFinder.getMaximumSize()<<std::endl;
+			  while(phiTrackFinder.getMaximumSize()>_minCluSize/5) { //fixme: make parameter
+				  double maxPhi=phiTrackFinder.getMaximum();
+				  streamlog_out(DEBUG8)<<"maximum at "<<maxPhi<<std::endl;
+
+				  //get one maximum
+				  Clusterer::cluster_type cluster=phiTrackFinder.getMaximimumCluster(2); //ascending
+				  streamlog_out(DEBUG8)<<"found cluster of size "<<cluster.size()<<std::endl;
+				  if(cluster.size()<_minCluSize) continue; //fixme: make parameter
+
+				  cluster=clupatra_new::cutHitsFromCluster(cluster, maxPhi, 10, 3);//fixme: make parameters
+				  if(cluster.size()<_minCluSize) continue; //fixme: make parameter
+
+				  //sort cluster (smallest layernumber first)
+				  cluster.sort( LayerSortOut() );
+
+				  //get trackState from maximum
+				  TrackStateImpl trackState=MakeTrackStateFromHits(cluster);
+					streamlog_out( DEBUG9 ) << "track parameters used in trackstate : "
+					<< "\t D0 "          <<  trackState.getD0()
+					<< "\t Phi :"        <<  trackState.getPhi()
+					<< "\t Omega "       <<  trackState.getOmega()
+					<< "\t Z0 "          <<  trackState.getZ0()
+					<< "\t tan(Lambda) " <<  trackState.getTanLambda()   <<std::endl;
+
+				  //fit track to maximum
+				  streamlog_out(DEBUG8)<<"fit track to maximum"<<std::endl;
+				  //this statement also associates the mTrk to cluster, but does not remove the unfit hits from the cluster!
+				  MarlinTrk::IMarlinTrack* mTrk=fitter(&cluster, trackState);
+				  if(clupatra_new::getNumberOfHitsIn(*mTrk)<_minCluSize) continue; //fixme: make parameter
+
+				  //todo: remove hits not in fit from cluster
+
+				  //remove hits in cluster from hitlist
+				  hitsInLayer=removeHitsFromHitListVector( cluster , hitsInLayer);
+
+				  int nHitsAdded = 0;
+				  //try to add more hits backwards and forward
+				  nHitsAdded += addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , false /*inwards*/) ;
+				  streamlog_out(DEBUG8)<<"added "<<nHitsAdded<<" inwards to fit"<<std::endl;
+				  //repeat for backwards
+				  if(nHitsAdded > _minCluSize) {
+
+					  {	  double chi; int ndf; IMPL::TrackStateImpl *ts=new IMPL::TrackStateImpl();
+						  mTrk->getTrackState(*ts, chi, ndf);
+							streamlog_out( DEBUG9 ) << "track parameters found in cluster : "
+							<< "\t D0 "          <<  ts->getD0()
+							<< "\t Phi :"        <<  ts->getPhi()
+							<< "\t Omega "       <<  ts->getOmega()
+							<< "\t Z0 "          <<  ts->getZ0()
+							<< "\t tan(Lambda) " <<  ts->getTanLambda()   <<std::endl;
+					  };
 
 
-  streamlog_out( DEBUG5 ) << "===============================================================================================\n"
-			  << "   first step of Clupatra algorithm: find seeds with NN-clustering  in " <<  _nLoop << " loops - max dist = " << _distCut <<" \n"
-			  << "===============================================================================================\n"  ;
-  
-  // ---- introduce a loop over increasing distance cuts for finding the tracks seeds
-  //      -> should fix (some of) the problems seen @ 3 TeV with extremely boosted jets
-  //
-  double dcut =  _distCut / _nLoop ;
-  for(int nloop=1 ; nloop <= _nLoop ; ++nloop){ 
+					  nHitsAdded += addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , true /*outwards*/, _trksystem ) ;
+					  streamlog_out(DEBUG8)<<"added "<<nHitsAdded<<" in total to fit"<<std::endl;
+					  mTrk=cluster.ext<MarTrk>();//mTrk=current attached track
+				  }
 
-    HitDistance dist( nloop * dcut , _cosAlphaCut ) ;
+				  if( writeCluTrackSegments ) {  //  ---- store track segments from the first main step  -----
+					streamlog_out( DEBUG8 ) << "writing cluster to seed cluster collection"<<std::endl;
+					cluCol->addElement(  converter( &cluster ) );
+				  }
 
-    outerRow = maxTPCLayers - 1 ;
-    
-    while( outerRow >= _minCluSize ) { //_padRowRange * .5 ) {
+				  //not a good cluster, put back hits
+				  if(nHitsAdded < _minCluSize) { //fixme: make parameter
+					  for( Clusterer::cluster_type::iterator ci=cluster.begin(); ci!=cluster.end(); ++ci ) {
+						hitsInLayer[ (*ci)->first->layer ].push_back( *ci )   ;
+					  }
+					  cluster.freeElements() ;
+					  cluster.clear() ;
+				  }
 
-      HitVec hits ;
-      hits.reserve( nHit ) ;
-      
-      // add all hits in pad row range to hits
-      for(int iRow = outerRow ; iRow > ( outerRow - _padRowRange) ; --iRow ) {
+				  if(!cluster.empty()) {
+					  double chi; int ndf; IMPL::TrackStateImpl *ts=new IMPL::TrackStateImpl();
+					  mTrk->getTrackState(*ts, chi, ndf);
+						streamlog_out( DEBUG9 ) << "track parameters found in cluster : "
+						<< "\t D0 "          <<  ts->getD0()
+						<< "\t Phi :"        <<  ts->getPhi()
+						<< "\t Omega "       <<  ts->getOmega()
+						<< "\t Z0 "          <<  ts->getZ0()
+						<< "\t tan(Lambda) " <<  ts->getTanLambda()   <<std::endl;
+					  cluster.ext<TrkState>()=ts;
+				  }
 
-	if( iRow > -1 ) {
+				  cluster.ext<MarTrk>() = 0 ;
+				  delete mTrk ;
 
-	  streamlog_out( DEBUG0 ) << "  copy " <<  hitsInLayer[ iRow ].size() << " hits for row " << iRow << std::endl ;
+				  if(!cluster.empty()) {
+					  cluList.push_back( new Clusterer::cluster_type(cluster) );
+//					  goto breakAll; //break all loops after first cluster is found!
+				  }
 
-	  std::copy( hitsInLayer[ iRow ].begin() , hitsInLayer[ iRow ].end() , std::back_inserter( hits )  ) ;
-	}
-      }
-      
-      //-----  cluster in given pad row range  -----------------------------
-      Clusterer::cluster_list sclu ;    
-      sclu.setOwner() ;  
-    
-      streamlog_out( DEBUG2 ) << "   call cluster_sorted with " <<  hits.size() << " hits " << std::endl ;
+			  } //loop over clusters
+		  }//for side
+	  }//for outerRow
+	  breakAll :;
+  }//if phibinning transform
+  else
+  { //nnclustering
 
-      nncl.cluster_sorted( hits.begin(), hits.end() , std::back_inserter( sclu ), dist , _minCluSize ) ;
-    
-      const static int merge_seeds = true ; 
-
-      if( merge_seeds ) { //-----------------------------------------------------------------------
 	
-	// sometimes we have split seed clusters as one link is just above the cut
-	// -> recluster in all hits of small clusters with 1.2 * cut 
-	float _smallClusterPadRowFraction = 0.9  ;
-	float _cutIncrease = 1.2 ;
-	// fixme: could make parameters ....
+	  streamlog_out( DEBUG5 ) << "===============================================================================================\n"
+				  << "   first step of Clupatra algorithm: find seeds with NN-clustering  in " <<  _nLoop << " loops - max dist = " << _distCut <<" \n"
+				  << "===============================================================================================\n"  ;
 
-	HitVec seedhits ;
-	Clusterer::cluster_list smallclu ; 
-	smallclu.setOwner() ;      
-	split_list( sclu, std::back_inserter(smallclu),  ClusterSize(  int( _padRowRange * _smallClusterPadRowFraction) ) ) ; 
-	for( Clusterer::cluster_list::iterator sci=smallclu.begin(), end= smallclu.end() ; sci!=end; ++sci ){
-	  for( Clusterer::cluster_type::iterator ci=(*sci)->begin(), end1= (*sci)->end() ; ci!=end1;++ci ){
-	    seedhits.push_back( *ci ) ; 
-	  }
-	}
-	// free hits from bad clusters 
-	std::for_each( smallclu.begin(), smallclu.end(), std::mem_fun( &CluTrack::freeElements ) ) ;
+	  // ---- introduce a loop over increasing distance cuts for finding the tracks seeds
+	  //      -> should fix (some of) the problems seen @ 3 TeV with extremely boosted jets
+	  //
+	  double dcut =  _distCut / _nLoop ;
+	  for(int nloop=1 ; nloop <= _nLoop ; ++nloop){
+
+		HitDistance dist( nloop * dcut , _cosAlphaCut ) ;
+
+		outerRow = maxTPCLayers - 1 ;
+
+		while( outerRow >= _minCluSize ) { //_padRowRange * .5 ) {
+
+		  HitVec hits ;
+		  hits.reserve( nHit ) ;
+
+		  // add all hits in pad row range to hits
+		  for(int iRow = outerRow ; iRow > ( outerRow - _padRowRange) ; --iRow ) {
+
+		if( iRow > -1 ) {
+
+		  streamlog_out( DEBUG0 ) << "  copy " <<  hitsInLayer[ iRow ].size() << " hits for row " << iRow << std::endl ;
+
+		  std::copy( hitsInLayer[ iRow ].begin() , hitsInLayer[ iRow ].end() , std::back_inserter( hits )  ) ;
+		}
+		  }
+
+		  //-----  cluster in given pad row range  -----------------------------
+		  Clusterer::cluster_list sclu ;
+		  sclu.setOwner() ;
+
+		  streamlog_out( DEBUG2 ) << "   call cluster_sorted with " <<  hits.size() << " hits " << std::endl ;
+
+		  nncl.cluster_sorted( hits.begin(), hits.end() , std::back_inserter( sclu ), dist , _minCluSize ) ;
+
+		  const static int merge_seeds = true ;
+
+		  if( merge_seeds ) { //-----------------------------------------------------------------------
+
+		// sometimes we have split seed clusters as one link is just above the cut
+		// -> recluster in all hits of small clusters with 1.2 * cut
+		float _smallClusterPadRowFraction = 0.9  ;
+		float _cutIncrease = 1.2 ;
+		// fixme: could make parameters ....
+
+		HitVec seedhits ;
+		Clusterer::cluster_list smallclu ;
+		smallclu.setOwner() ;
+		split_list( sclu, std::back_inserter(smallclu),  ClusterSize(  int( _padRowRange * _smallClusterPadRowFraction) ) ) ;
+		for( Clusterer::cluster_list::iterator sci=smallclu.begin(), end= smallclu.end() ; sci!=end; ++sci ){
+		  for( Clusterer::cluster_type::iterator ci=(*sci)->begin(), end1= (*sci)->end() ; ci!=end1;++ci ){
+			seedhits.push_back( *ci ) ;
+		  }
+		}
+		// free hits from bad clusters
+		std::for_each( smallclu.begin(), smallclu.end(), std::mem_fun( &CluTrack::freeElements ) ) ;
+
+		HitDistance distLarge( nloop * dcut * _cutIncrease ) ;
+
+		nncl.cluster_sorted( seedhits.begin(), seedhits.end() , std::back_inserter( sclu ), distLarge , _minCluSize ) ;
+
+		  } //------------------------------------------------------------------------------------------
+
+		  streamlog_out( DEBUG ) << "     found " <<  sclu.size() << "  clusters " << std::endl ;
+
+		  // try to split up clusters according to multiplicity
+		  int layerWithMultiplicity = _padRowRange - 2  ; // fixme: make parameter
+		  split_multiplicity( sclu , layerWithMultiplicity , 10 ) ;
+
+
+		  // remove clusters whith too many duplicate hits per pad row
+		  Clusterer::cluster_list bclu ;    // bad clusters
+		  bclu.setOwner() ;
+		  split_list( sclu, std::back_inserter(bclu),  DuplicatePadRows( maxTPCLayers, _duplicatePadRowFraction  ) ) ;
+		  // free hits from bad clusters
+		  std::for_each( bclu.begin(), bclu.end(), std::mem_fun( &CluTrack::freeElements ) ) ;
+
+
+		  // ---- now we also need to remove the hits from good cluster seeds from the hitsInLayers:
+		  for( Clusterer::cluster_list::iterator sci=sclu.begin(), end= sclu.end() ; sci!=end; ++sci ){
+		for( Clusterer::cluster_type::iterator ci=(*sci)->begin(), end1= (*sci)->end() ; ci!=end1;++ci ){
+
+		  // this is not cheap ...
+		  hitsInLayer[ (*ci)->first->layer ].remove( *ci )  ;
+		}
+		  }
+
+		  // now we have 'clean' seed clusters
+		  // Write debug collection with seed clusters:
+		  // convert the clusters into tracks and write the resulting tracks into the existing debug collection seedCol.
+		  // The conversion is performed by the STL transform() function, the insertion to the end of the
+		  // debug track collection is done by creating an STL back_inserter iterator on the LCCollectionVector seedCol
+		  if( writeSeedCluster ) {
+		std::transform( sclu.begin(), sclu.end(), std::back_inserter( *seedCol ) , converter ) ;
+		  }
+
+		  //      std::transform( sclu.begin(), sclu.end(), std::back_inserter( seedTrks) , fitter ) ;
+		  // reduce memory footprint: deal with one KalTest track at a time and delete it, when done
+
+		  streamlog_out( DEBUG2 ) << "  -------- search seeds with distCut=" << nloop * dcut
+					  << " starting in row "   <<  outerRow
+					  << " with padrow range " << _padRowRange
+					  <<  " - found " << sclu.size() << " seed clusters "
+					  << std::endl ;
+
+		  for( Clusterer::cluster_list::iterator icv = sclu.begin(), end =sclu.end()  ; icv != end ; ++ icv ) {
+
+		int nHitsAdded = 0 ;
+
+		//	streamlog_out( DEBUG4 ) <<  " call fitter for seed cluster with " << (*icv)->size() << " hits " << std::endl ;
+
+		MarlinTrk::IMarlinTrack* mTrk = fitter( *icv ) ;
+
+		nHitsAdded += addHitsAndFilter( *icv , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , zIndex ) ;
+
+		static const bool backward = true ;
+		nHitsAdded += addHitsAndFilter( *icv , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , zIndex, backward ) ;
+		// in order to use smooth for backward extrapolation call with   _trksystem  - does not work well...
+		// nHitsAdded += addHitsAndFilter( *icv , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , zIndex, backward , _trksystem ) ;
+
+
+		// drop seed clusters with no hits added - but not in the very forward region...
+		if( nHitsAdded < 1  &&  outerRow >   2*_padRowRange  ){  //FIXME: make parameter ?
 	
-	HitDistance distLarge( nloop * dcut * _cutIncrease ) ;
-
-	nncl.cluster_sorted( seedhits.begin(), seedhits.end() , std::back_inserter( sclu ), distLarge , _minCluSize ) ;
-
-      } //------------------------------------------------------------------------------------------
-
-      streamlog_out( DEBUG ) << "     found " <<  sclu.size() << "  clusters " << std::endl ;
-
-      // try to split up clusters according to multiplicity
-      int layerWithMultiplicity = _padRowRange - 2  ; // fixme: make parameter 
-      split_multiplicity( sclu , layerWithMultiplicity , 10 ) ;
-
-
-      // remove clusters whith too many duplicate hits per pad row
-      Clusterer::cluster_list bclu ;    // bad clusters  
-      bclu.setOwner() ;      
-      split_list( sclu, std::back_inserter(bclu),  DuplicatePadRows( maxTPCLayers, _duplicatePadRowFraction  ) ) ;
-      // free hits from bad clusters 
-      std::for_each( bclu.begin(), bclu.end(), std::mem_fun( &CluTrack::freeElements ) ) ;
-
-     
-      // ---- now we also need to remove the hits from good cluster seeds from the hitsInLayers:
-      for( Clusterer::cluster_list::iterator sci=sclu.begin(), end= sclu.end() ; sci!=end; ++sci ){
-	for( Clusterer::cluster_type::iterator ci=(*sci)->begin(), end1= (*sci)->end() ; ci!=end1;++ci ){
+		  std::auto_ptr<Track> lcioTrk( converter( *icv ) ) ;
 	
-	  // this is not cheap ...
-	  hitsInLayer[ (*ci)->first->layer ].remove( *ci )  ; 
-	}
-      }
-    
-      // now we have 'clean' seed clusters
-      // Write debug collection with seed clusters:
-      // convert the clusters into tracks and write the resulting tracks into the existing debug collection seedCol.
-      // The conversion is performed by the STL transform() function, the insertion to the end of the
-      // debug track collection is done by creating an STL back_inserter iterator on the LCCollectionVector seedCol
-      if( writeSeedCluster ) {
-	std::transform( sclu.begin(), sclu.end(), std::back_inserter( *seedCol ) , converter ) ;
-      }
-      
-      //      std::transform( sclu.begin(), sclu.end(), std::back_inserter( seedTrks) , fitter ) ;
-      // reduce memory footprint: deal with one KalTest track at a time and delete it, when done
-    
-      streamlog_out( DEBUG2 ) << "  -------- search seeds with distCut=" << nloop * dcut 
-			      << " starting in row "   <<  outerRow 
-			      << " with padrow range " << _padRowRange
-			      <<  " - found " << sclu.size() << " seed clusters " 
-			      << std::endl ;
-      
-      for( Clusterer::cluster_list::iterator icv = sclu.begin(), end =sclu.end()  ; icv != end ; ++ icv ) {
-      
-	int nHitsAdded = 0 ;
-
-	//	streamlog_out( DEBUG4 ) <<  " call fitter for seed cluster with " << (*icv)->size() << " hits " << std::endl ;
-
-	MarlinTrk::IMarlinTrack* mTrk = fitter( *icv ) ;
-
-	nHitsAdded += addHitsAndFilter( *icv , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , zIndex ) ; 
-      
-	static const bool backward = true ;
-	nHitsAdded += addHitsAndFilter( *icv , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , zIndex, backward ) ; 
-	// in order to use smooth for backward extrapolation call with   _trksystem  - does not work well...
-	// nHitsAdded += addHitsAndFilter( *icv , hitsInLayer , _dChi2Max, _chi2Cut , _maxStep , zIndex, backward , _trksystem ) ; 
+		  streamlog_out( DEBUG2) << "=============  poor seed cluster - no hits added - started from row " <<  outerRow << "\n"
+					 << *lcioTrk << std::endl ;
 
 
-	// drop seed clusters with no hits added - but not in the very forward region...
-	if( nHitsAdded < 1  &&  outerRow >   2*_padRowRange  ){  //FIXME: make parameter ?
+		  for( Clusterer::cluster_type::iterator ci=(*icv)->begin(), end1= (*icv)->end() ; ci!=end1; ++ci ) {
+			hitsInLayer[ (*ci)->first->layer ].push_back( *ci )   ;
+		  }
+		  (*icv)->freeElements() ;
+		  (*icv)->clear() ;
+		}
 
-	  std::auto_ptr<Track> lcioTrk( converter( *icv ) ) ; 
-
-	  streamlog_out( DEBUG2) << "=============  poor seed cluster - no hits added - started from row " <<  outerRow << "\n" 
-				 << *lcioTrk << std::endl ;
-	  
-	  
-	  for( Clusterer::cluster_type::iterator ci=(*icv)->begin(), end1= (*icv)->end() ; ci!=end1; ++ci ) {
-	    hitsInLayer[ (*ci)->first->layer ].push_back( *ci )   ; 
-	  }
-	  (*icv)->freeElements() ;
-	  (*icv)->clear() ;
-	}
+		// if( nHitsAdded < 1 ){
+		//   Track* lcioTrk = converter( *icv ) ;
+		//   streamlog_out( DEBUG5) << "  poor seed cluster - no hits added - n hits = " << nHitsAdded << "\n"
+		// 			 << *lcioTrk << std::endl ;
+		//   delete lcioTrk ;
+		// }
 	
-	// if( nHitsAdded < 1 ){
-	//   Track* lcioTrk = converter( *icv ) ; 
-	//   streamlog_out( DEBUG5) << "  poor seed cluster - no hits added - n hits = " << nHitsAdded << "\n" 
-	// 			 << *lcioTrk << std::endl ;
-	//   delete lcioTrk ;
-	// }
+		if( writeCluTrackSegments )  //  ---- store track segments from the first main step  -----
+		  cluCol->addElement(  converter( *icv ) );
 
-	if( writeCluTrackSegments )  //  ---- store track segments from the first main step  ----- 
-	  cluCol->addElement(  converter( *icv ) );
+		// reset the pointer to the KalTest track - as we are done with this track
+		(*icv)->ext<MarTrk>() = 0 ;
+
+		delete mTrk ;
+		  }
 	
-	// reset the pointer to the KalTest track - as we are done with this track
-	(*icv)->ext<MarTrk>() = 0 ;
+		  // merge the good clusters to final list
+		  cluList.merge( sclu ) ;
 	
-	delete mTrk ;
-      } 
+		  outerRow -= _padRowRange ;
 
-      // merge the good clusters to final list
-      cluList.merge( sclu ) ;
+		} //while outerRow > padRowRange
 
-      outerRow -= _padRowRange ;
-    
-    } //while outerRow > padRowRange 
-  
-  }// nloop
-
-  //---------------------------------------------------------------------------------------------------------
-
+	  }// nloop
+	  //---------------------------------------------------------------------------------------------------------
+  }
   timer.time( t_seedtracks ) ;
   
   timer.time( t_recluster ) ;
@@ -809,7 +995,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
   //===============================================================================================
   //  do a global reclustering in leftover hits
   //===============================================================================================
-  static const int do_global_reclustering = true ;
+  static const int do_global_reclustering = !pixelTPC ;
   if( do_global_reclustering ) {
 
     outerRow = maxTPCLayers - 1 ;
@@ -1032,19 +1218,66 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 
   //---- refit cluster tracks individually to save memory ( KalTest tracks have ~1MByte each)
 
-  IMarlinTrkFitter fit(_trksystem,  _dChi2Max) ; // fixme: do we need a different chi2 max here ????
+  IMarlinTrkFitter refit(_trksystem, pixelTPC ? _dChi2Max :  _dChi2MaxRefit) ; // a different chi here
 
-  for( Clusterer::cluster_list::iterator icv = cluList.begin() , end = cluList.end() ; icv != end ; ++ icv ) {
+  int current_cluster=0;
+  for( Clusterer::cluster_list::iterator icv = cluList.begin()  ; icv != cluList.end() ; ++ icv ) {
 
     if( (*icv)->empty() ) 
       continue ;
 
-    MarlinTrk::IMarlinTrack* trk = fit( *icv ) ;
-    trk->smooth() ;
-    Track* lcioTrk = converter( *icv ) ; 
-    tsCol->push_back(  lcioTrk ) ;
-    lcioTrk->ext<MarTrk>() = 0 ;
-    delete trk ;
+//    Track* lcioTrk = converter( *icv ) ;
+//    trackSegmentCol->push_back(  lcioTrk ) ;
+
+	streamlog_out(DEBUG9)<<"start refit for cluster "<<current_cluster++<<" with size "<<(*icv)->size()<<" at time "<<std::clock()/double(CLOCKS_PER_SEC)<<std::endl;
+
+	if(pixelTPC) {
+
+		streamlog_out( DEBUG9 ) << "track parameters for start fit from cluster : "
+		<< "\t D0 "          <<  (*icv)->ext<TrkState>()->getD0()
+		<< "\t Phi :"        <<  (*icv)->ext<TrkState>()->getPhi()
+		<< "\t Omega "       <<  (*icv)->ext<TrkState>()->getOmega()
+		<< "\t Z0 "          <<  (*icv)->ext<TrkState>()->getZ0()
+		<< "\t tan(Lambda) " <<  (*icv)->ext<TrkState>()->getTanLambda() <<std::endl;
+		streamlog_out(DEBUG9)<< "covmatrix {";
+		for(int i=0; i<15; i++) streamlog_out(DEBUG8) << sqrt( (*icv)->ext<TrkState>()->getCovMatrix()[i] ) << (i==14 ? " }\n" : ", ");
+
+		auto covMat=(*icv)->ext<TrkState>()->getCovMatrix();
+		for(int i=0, j=1; i<15; i+=++j) covMat[i]*=10000;//set error on diagonal much larger
+		(*icv)->ext<TrkState>()->setCovMatrix(covMat);
+
+//		const float d0error=1, //set a large d0 error
+//				phierror=1e-2,
+//				omegaerror=1e-6, //=1e-3
+//				z0error=1,
+//				tanlambdaerror=1,
+//				unknown=0.; //set unknowns to zero after the 3-fit method
+//		EVENT::FloatVec covMat = {
+//				  d0error,
+//				  unknown, phierror,
+//				  unknown, unknown, omegaerror,
+//				  unknown, unknown, unknown, z0error,
+//				  unknown, unknown, unknown, unknown, tanlambdaerror};
+//		(*icv)->ext<TrkState>()->setCovMatrix(covMat);
+
+		constexpr bool fitInwards=true; //is actually outwards?
+		MarlinTrk::IMarlinTrack* trk = refit( *icv , *(*icv)->ext<TrkState>(), fitInwards ) ; //associates trk to icv, but keeps all hits in icv
+		delete (*icv)->ext<TrkState>(); (*icv)->ext<TrkState>()=0; //deletes trkState;
+		streamlog_out(DEBUG7)<<"start smooth at time "<<std::clock()/double(CLOCKS_PER_SEC)<<std::endl;
+		trk->smooth() ;
+	//        Track* lcioTrk = converter( *icv ) ; //keep all hits, even those not in the refit
+		Track* lcioTrk = converter( trk ) ; //changed for pixelTPC in order to allow refitting with a different chi2
+		tsCol->push_back( lcioTrk ) ;
+		lcioTrk->ext<MarTrk>() = 0 ;
+		delete trk ;
+	} else  { //pad
+	    MarlinTrk::IMarlinTrack* trk = refit( *icv ) ;
+	    trk->smooth() ;
+	    Track* lcioTrk = converter( *icv ) ;
+	    tsCol->push_back(  lcioTrk ) ;
+	    lcioTrk->ext<MarTrk>() = 0 ;
+	    delete trk ;
+	}
   }
   
   timer.time( t_finalfit) ;
@@ -1184,7 +1417,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 	// //int result = createFinalisedLCIOTrack( mTrk, hits, track, ! MarlinTrk::IMarlinTrack::backward, icov, _bfield,  _dChi2Max ) ; 
 	// // ??? 
       
-	MarlinTrk::IMarlinTrack* mTrk = fit( &hits ) ;
+	MarlinTrk::IMarlinTrack* mTrk = refit( &hits ) ;
 	mTrk->smooth() ;
 	Track* track = converter( &hits ) ; 
 	tsCol->push_back(  track ) ;
