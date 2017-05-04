@@ -904,7 +904,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 
 
 		  // ---- now we also need to remove the hits from good cluster seeds from the hitsInLayers:
-		  for( Clusterer::cluster_list::iterator sci=sclu.begin(), end= sclu.end() ; sci!=end; ++sci ){
+		  for( Clusterer::cluster_list::iterator sci=sclu.begin(), end0= sclu.end() ; sci!=end0; ++sci ){
 		for( Clusterer::cluster_type::iterator ci=(*sci)->begin(), end1= (*sci)->end() ; ci!=end1;++ci ){
 
 		  // this is not cheap ...
@@ -948,12 +948,11 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 
 		// drop seed clusters with no hits added - but not in the very forward region...
 		if( nHitsAdded < 1  &&  outerRow >   2*_padRowRange  ){  //FIXME: make parameter ?
-	
-		  std::auto_ptr<Track> lcioTrk( converter( *icv ) ) ;
+		  std::unique_ptr<Track> lcioTrk( converter( *icv ) ) ;
+
 	
 		  streamlog_out( DEBUG2) << "=============  poor seed cluster - no hits added - started from row " <<  outerRow << "\n"
 					 << *lcioTrk << std::endl ;
-
 
 		  for( Clusterer::cluster_type::iterator ci=(*icv)->begin(), end1= (*icv)->end() ; ci!=end1; ++ci ) {
 			hitsInLayer[ (*ci)->first->layer ].push_back( *ci )   ;
@@ -1027,7 +1026,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 	
 	streamlog_out( DEBUG ) << "      hit candidates in row " << iRow << " : " << hitsInLayer[ iRow ].size() << std::endl ;
 	
-	for( HitList::iterator hlIt=hitsInLayer[ iRow ].begin() , end = hitsInLayer[ iRow ].end() ; hlIt != end ; ++hlIt ) {
+	for( HitList::iterator hlIt=hitsInLayer[ iRow ].begin() ; hlIt != hitsInLayer[ iRow ].end() ; ++hlIt ) {
 	  streamlog_out( DEBUG ) << "      hit candidate for reclustering " << (*hlIt)->first 
 				 << " ( std::abs( (*hlIt)->first->pos.z() ) > zMaxInnerHits  ||  (*hlIt)->first->pos.rho() >  rhoMaxInnerHits )  " 
 				 <<   ( std::abs( (*hlIt)->first->pos.z() ) > zMaxInnerHits  ||  (*hlIt)->first->pos.rho() >  rhoMaxInnerHits )
@@ -1061,7 +1060,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
       
       //    _dChi2Max = 5. * _dChi2Max ; //FIXME !!!!!!!!!
       
-      for( Clusterer::cluster_list::iterator it= loclu.begin(), end= loclu.end() ; it != end ; ++it ){
+      for( Clusterer::cluster_list::iterator it= loclu.begin() ; it != loclu.end() ; ++it ){
 	
 	CluTrack* clu = *it ;
 	
@@ -1296,7 +1295,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
     usedHits->reserve(   nncluHits.size() ) ;
     unUsedHits->reserve( nncluHits.size() ) ;
     
-    for( HitVec::iterator it = nncluHits.begin(), end = nncluHits.end(); it!=end;++it ){
+    for( HitVec::iterator it = nncluHits.begin(); it!=nncluHits.end();++it ){
       
       if( (*it)->second != 0 ){   usedHits->push_back( (*it)->first->lcioHit ) ;
       } else {                  unUsedHits->push_back( (*it)->first->lcioHit ) ;          
@@ -1350,10 +1349,10 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 	
 	bool isIncompleteSegment =   !ti->isCurler  && ( !ti->startsInner || ( !ti->isCentral && !ti->isForward )  ) ;  
 	
-	std::bitset<32> type = trk->getType() ;
+	std::bitset<32> trkType = trk->getType() ;
 
 
-	if( isIncompleteSegment  && ! type[ ILDTrackTypeBit::SEGMENT ]){ 
+	if( isIncompleteSegment  && ! trkType[ ILDTrackTypeBit::SEGMENT ]){ 
 	  
 	  incSegVec.push_back(  trkMakeElement( trk )  ) ; 
 	  
@@ -1459,9 +1458,9 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
       TrackImpl* trk = (TrackImpl*) tsCol->getElementAt(i) ;
       
 
-      std::bitset<32> type = trk->getType() ;
+      std::bitset<32> trkType = trk->getType() ;
 
-      if( type[ ILDTrackTypeBit::SEGMENT ] ) 
+      if( trkType[ ILDTrackTypeBit::SEGMENT ] ) 
 	continue ;   // ignore previously merged track segments
 
       const TrackInfoStruct* ti = trk->ext<TrackInfo>() ;
@@ -1892,7 +1891,7 @@ void ClupatraProcessor::pickUpSiTrackerHits( EVENT::LCCollection* trackCol , LCE
       // create a temporary MarlinTrk
       //--------------------------------------------
       
-      std::auto_ptr<MarlinTrk::IMarlinTrack> mTrk( _trksystem->createTrack()  ) ;
+      std::unique_ptr<MarlinTrk::IMarlinTrack> mTrk( _trksystem->createTrack()  ) ;
 
       const EVENT::TrackState* ts = trk->getTrackState( lcio::TrackState::AtIP ) ; 
       

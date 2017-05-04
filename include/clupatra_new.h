@@ -186,7 +186,7 @@ namespace clupatra_new{
     inline int index( double z) {  return  (int) std::floor( ( z - _zmin ) / ( _zmax - _zmin ) * _N ) ;  } 
 
   protected:
-    ZIndex() {} ;
+//    ZIndex() {} ;
     float _zmin ;
     float _zmax ;
     int _N ;
@@ -790,7 +790,7 @@ protected:
 
   class Timer{
   public:
-    Timer(){
+    Timer() : _clocks(), _names() {
       _clocks.reserve( 100 ) ;
       _names.reserve( 100 ) ;
       

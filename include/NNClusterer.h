@@ -90,7 +90,7 @@ namespace nnclu {
     PtrVector() : _isOwner( false ) {}
     ~PtrVector() {
       if( _isOwner ) 
-        for( typename vec::iterator i = vec::begin(),end = vec::end(); i != end ; delete *i++ ) ; //++i ) delete *i ;
+        for( typename vec::iterator i = vec::begin(); i != vec::end() ; delete *i++ ) ; //++i ) delete *i ;
     }
     void setOwner( bool val=true ) { _isOwner = val ; }
   };
@@ -107,7 +107,7 @@ namespace nnclu {
     PtrList() : _isOwner( false ) {}
     ~PtrList() {
       if( _isOwner ) 
-        for( typename vec::iterator i = vec::begin(),end = vec::end(); i != end ; delete *i++ ) ; //++i ) delete *i ;
+        for( typename vec::iterator i = vec::begin(); i != vec::end() ; delete *i++ ) ; //++i ) delete *i ;
     }
     void setOwner( bool val=true ) { _isOwner = val ; }
   };
@@ -133,7 +133,7 @@ namespace nnclu {
     Cluster() : ID(0) {}
   
     /** C'tor that takes the first element */
-    Cluster( Element<T>* element)  {
+    Cluster( Element<T>* element) : ID(0) {
       static int SID=0 ;  //DEBUG
       ID = SID++ ;      //DEBUG
       addElement( element ) ;
@@ -164,7 +164,7 @@ namespace nnclu {
      */
     void freeElements(){
       
-      for( typename Cluster<T>::iterator it = this->begin(), end = this->end() ; it != end ; it++ ){
+      for( typename Cluster<T>::iterator it = this->begin(); it != this->end() ; it++ ){
         (*it)->second = 0 ;
       }
       
@@ -178,7 +178,7 @@ namespace nnclu {
     /** Merges all elements from the other cluster cl into this cluster */
     void mergeClusters( Cluster<T>* cl ) {
       
-      for( typename Cluster<T>::iterator it = cl->begin(), end = cl->end() ; it != end ; it++ ){
+      for( typename Cluster<T>::iterator it = cl->begin(); it != cl->end() ; it++ ){
         (*it)->second = this  ;
       }
       this->merge( *cl ) ;
@@ -190,7 +190,7 @@ namespace nnclu {
       //  typename Cluster<T>::iterator it = this->begin() ;
       //  while( it !=  this->end()  )
     
-      for( typename Cluster<T>::iterator it = this->begin() , end =  this->end()  ;  it != end ; ++it ){
+      for( typename Cluster<T>::iterator it = this->begin() ;  it != this->end() ; ++it ){
       
         typename Cluster<T>::value_type h = *it ; 
       

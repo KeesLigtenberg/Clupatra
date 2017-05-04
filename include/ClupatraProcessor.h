@@ -79,6 +79,11 @@ class ClupatraProcessor : public marlin::Processor {
   
   
   ClupatraProcessor() ;
+
+  //disallow copying and assignment
+  ClupatraProcessor(const ClupatraProcessor&) = delete;
+  ClupatraProcessor& operator=(const ClupatraProcessor&) = delete;
+
   
   /** Called at the begin of the job before anything is read.
    * Use to initialize the processor, e.g. book histograms.
