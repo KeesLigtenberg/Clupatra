@@ -757,7 +757,7 @@ void ClupatraProcessor::processEvent( LCEvent * evt ) {
 
 				  int nHitsAdded = 0;
 				  //try to add more hits backwards and forward
-				  nHitsAdded += addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max , _maxStep , false /*inwards*/) ;
+				  nHitsAdded +=  addHitsAndFilterPixel( &cluster , hitsInLayer , _dChi2Max , _maxStep , false /*inwards*/) ;
 				  streamlog_out(DEBUG8)<<"added "<<nHitsAdded<<" inwards to fit"<<std::endl;
 				  //repeat for backwards
 				  if(nHitsAdded > _minCluSize) {

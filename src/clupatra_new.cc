@@ -76,6 +76,20 @@ namespace clupatra_new{
 
   //-------------------------------------------------------------------------------
 
+  inline bool isPixelTPC() {
+	  DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+	  const std::string TPCReadoutType= lcdd.constantAsString("TPC_readoutType");
+	  return (TPCReadoutType=="pixel");
+  }
+  inline std::string getTPCReadoutFieldDescription() {
+	  DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+	  if(isPixelTPC()) {
+		 return lcdd.idSpecification("TPCCollection").fieldDescription();//get field description from dd4hep
+	  } else {
+	     return UTIL::LCTrackerCellID::encoding_string();
+	  }
+  }
+
   int addHitsAndFilterPixel( CluTrack* clu, HitListVector& hLV , double dChi2Max, unsigned maxStep, bool outwards,
 			MarlinTrk::IMarlinTrkSystem* trkSys ) {
 
@@ -103,7 +117,7 @@ namespace clupatra_new{
 	      }
 
 	      //setup conversion layerNumber -> layerID
-	      UTIL::BitField64 encoder( UTIL::LCTrackerCellID::encoding_string() ) ;
+	      UTIL::BitField64 encoder( getTPCReadoutFieldDescription() ) ;
 	      encoder[UTIL::LCTrackerCellID::subdet()] = UTIL::ILDDetID::TPC ;
 
 	      //reverse track if necessary
@@ -1438,7 +1452,7 @@ clupatra_new::Clusterer::cluster_type cutHitsFromCluster(
   lcio::TrackImpl* LCIOTrackConverter::addProperties(MarlinTrk::IMarlinTrack * mtrk,
  		lcio::TrackImpl* trk)  {
 
-      static lcio::BitField64 encoder( lcio::LCTrackerCellID::encoding_string() ) ;
+      static lcio::BitField64 encoder( getTPCReadoutFieldDescription() ) ;
 
       std::vector<std::pair<EVENT::TrackerHit*, double> > hitsInFit ;
       mtrk->getHitsInFit( hitsInFit ) ;
@@ -1539,7 +1553,16 @@ clupatra_new::Clusterer::cluster_type cutHitsFromCluster(
 	if( code ==  MarlinTrk::IMarlinTrack::no_intersection ){
 	  
 	  encoder[ lcio::LCTrackerCellID::subdet() ] = CaloFaceEndcapID ;
-	  encoder[ lcio::LCTrackerCellID::side()   ] = ( lHit->getPosition()[2] > 0.  ?   lcio::ILDDetID::fwd  :  lcio::ILDDetID::bwd  ) ;
+
+	  if(isPixelTPC()) {
+			encoder[lcio::ILDCellID0::side] =
+					lHit->getPosition()[2] > 0. ?
+							1 /*fwd*/ : 3 /*bwd*/ ; //because dd4hep bitfield is unsigned!
+	  } else {
+			encoder[lcio::ILDCellID0::side] = (
+					lHit->getPosition()[2] > 0. ?
+							lcio::ILDDetID::fwd : lcio::ILDDetID::bwd);
+      }
 
 	  layerID = encoder.lowWord() ;
 	  
